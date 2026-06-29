@@ -28,6 +28,7 @@ import {
   Check,
   CloudDownload,
   FileImage,
+  FolderOpen,
   Loader2,
   SquareArrowOutUpRight,
   Trash2,
@@ -40,6 +41,7 @@ interface QueueItem {
   file: File;
   inputUrl: string;
   fileName: string;
+  relativePath?: string;
   inputSize: number;
   status: "queued" | "processing" | "done" | "error";
   error?: string;
@@ -89,8 +91,83 @@ function baseName(name: string) {
   return name.replace(/\.[^.]+$/, "");
 }
 
+function leafName(name: string) {
+  return name.split("/").pop() || name;
+}
+
+function outputFileName(it: QueueItem, preservePath: boolean) {
+  const sourceName = preservePath ? it.relativePath || it.fileName : leafName(it.fileName);
+  const ext = (it.outputExt || ".bin").startsWith(".") ? it.outputExt! : `.${it.outputExt}`;
+  return `${baseName(sourceName)}${ext}`;
+}
+
+function isImageFile(file: File) {
+  if (file.type.startsWith("image/")) return true;
+  return /\.(avif|bmp|gif|heic|heif|jpe?g|png|tiff?|webp)$/i.test(file.name);
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
+type FileWithPath = { file: File; relativePath?: string };
+
+async function fileFromEntry(entry: FileSystemFileEntry) {
+  return new Promise<File>((resolve, reject) => entry.file(resolve, reject));
+}
+
+async function readDirectoryEntries(entry: FileSystemDirectoryEntry) {
+  const reader = entry.createReader();
+  const entries: FileSystemEntry[] = [];
+
+  while (true) {
+    const batch = await new Promise<FileSystemEntry[]>((resolve, reject) => {
+      reader.readEntries(resolve, reject);
+    });
+    if (!batch.length) break;
+    entries.push(...batch);
+  }
+
+  return entries;
+}
+
+async function collectFilesFromEntry(
+  entry: FileSystemEntry,
+  parentPath = "",
+): Promise<Array<FileWithPath & { relativePath: string }>> {
+  const relativePath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+
+  if (entry.isFile) {
+    const file = await fileFromEntry(entry as FileSystemFileEntry);
+    return [{ file, relativePath }];
+  }
+
+  if (!entry.isDirectory) return [];
+
+  const children = await readDirectoryEntries(entry as FileSystemDirectoryEntry);
+  const nested = await Promise.all(children.map((child) => collectFilesFromEntry(child, relativePath)));
+  return nested.flat();
+}
+
+async function collectFilesFromDataTransfer(dataTransfer: DataTransfer) {
+  const entries = Array.from(dataTransfer.items || [])
+    .map((item) => item.webkitGetAsEntry?.())
+    .filter((entry): entry is FileSystemEntry => Boolean(entry));
+
+  if (!entries.length) {
+    return Array.from(dataTransfer.files).map((file) => ({
+      file,
+      relativePath: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
+    }));
+  }
+
+  const files = await Promise.all(entries.map((entry) => collectFilesFromEntry(entry)));
+  return files.flat();
+}
+
 export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
   const [items, setItems] = useState<QueueItem[]>([]);
   const [params, setParams] = useState<BatchParams>(DEFAULT_PARAMS);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -122,16 +199,30 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function addFiles(fileList: FileList | File[]) {
+  async function addFiles(fileList: FileList | File[] | FileWithPath[]) {
     if (items.length) return; // locked mode
-    const files = Array.from(fileList).filter((f) => f.type.startsWith("image/"));
+    const raw = Array.from(fileList as ArrayLike<File | FileWithPath>);
+    const incoming = raw.map((item) => {
+      if (item instanceof File) {
+        return {
+          file: item,
+          relativePath: (item as File & { webkitRelativePath?: string }).webkitRelativePath || item.name,
+        };
+      }
+      return {
+        file: item.file,
+        relativePath: item.relativePath || (item.file as File & { webkitRelativePath?: string }).webkitRelativePath || item.file.name,
+      };
+    });
+    const files = incoming.filter(({ file }) => isImageFile(file));
     if (!files.length) return;
 
-    const added: QueueItem[] = files.map((file) => ({
+    const added: QueueItem[] = files.map(({ file, relativePath }) => ({
       id: nanoid(),
       file,
       inputUrl: URL.createObjectURL(file),
-      fileName: file.name,
+      fileName: relativePath || file.name,
+      relativePath,
       inputSize: file.size,
       status: "queued",
     }));
@@ -209,7 +300,7 @@ export default function Home() {
         ),
       );
 
-      const threads = Math.max(1, Math.min(8, (navigator as any).hardwareConcurrency || 4));
+      const threads = Math.max(1, Math.min(8, navigator.hardwareConcurrency || 4));
       const batchSize = Math.max(4, threads * 2);
 
       for (let i = 0; i < toProcess.length; i += batchSize) {
@@ -239,8 +330,8 @@ export default function Home() {
                 }),
               );
               setProcessedCount((c) => c + 1);
-            } catch (e: any) {
-              const msg = e?.message ? String(e.message) : "处理失败";
+            } catch (e: unknown) {
+              const msg = errorMessage(e, "处理失败");
               setItems((prev) => prev.map((x) => (x.id === it.id ? { ...x, status: "error", error: msg } : x)));
               setProcessedCount((c) => c + 1);
             }
@@ -250,9 +341,9 @@ export default function Home() {
 
       toast.dismiss(toastId);
       toast.success("批量处理完成");
-    } catch (e: any) {
+    } catch (e: unknown) {
       toast.dismiss(toastId);
-      toast.error(e?.message ? String(e.message) : "批量处理失败");
+      toast.error(errorMessage(e, "批量处理失败"));
     } finally {
       setIsProcessing(false);
     }
@@ -263,8 +354,7 @@ export default function Home() {
       toast.message("这张图还没处理完成");
       return;
     }
-    const ext = (it.outputExt || ".bin").startsWith(".") ? it.outputExt! : `.${it.outputExt}`;
-    saveAs(it.outputBlob, `${baseName(it.fileName)}${ext}`);
+    saveAs(it.outputBlob, outputFileName(it, false));
   }
 
   async function downloadZipAll() {
@@ -278,8 +368,7 @@ export default function Home() {
     try {
       const zip = new JSZip();
       for (const it of done) {
-        const ext = (it.outputExt || ".bin").startsWith(".") ? it.outputExt! : `.${it.outputExt}`;
-        zip.file(`${baseName(it.fileName)}${ext}`, it.outputBlob!);
+        zip.file(outputFileName(it, true), it.outputBlob!);
       }
       const blob = await zip.generateAsync({ type: "blob" });
       const dt = new Date();
@@ -287,9 +376,9 @@ export default function Home() {
       saveAs(blob, `squoosh-batch-${tag}.zip`);
       toast.dismiss(toastId);
       toast.success("ZIP 已生成");
-    } catch (e: any) {
+    } catch (e: unknown) {
       toast.dismiss(toastId);
-      toast.error(e?.message ? String(e.message) : "ZIP 打包失败");
+      toast.error(errorMessage(e, "ZIP 打包失败"));
     }
   }
 
@@ -301,11 +390,20 @@ export default function Home() {
         e.preventDefault();
         e.stopPropagation();
       }}
-      onDrop={(e) => {
+      onDrop={async (e) => {
         if (items.length) return;
         e.preventDefault();
         e.stopPropagation();
-        if (e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files);
+        if (!e.dataTransfer) return;
+        const toastId = toast.loading("正在读取拖入内容…");
+        try {
+          const files = await collectFilesFromDataTransfer(e.dataTransfer);
+          toast.dismiss(toastId);
+          await addFiles(files);
+        } catch (err: unknown) {
+          toast.dismiss(toastId);
+          toast.error(errorMessage(err, "读取拖入文件夹失败"));
+        }
       }}
     >
       <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_20%,oklch(0.52_0.20_145/.16),transparent_55%),radial-gradient(circle_at_80%_30%,oklch(0.65_0.21_35/.10),transparent_55%)]" />
@@ -318,7 +416,7 @@ export default function Home() {
             <div>
               <div className="text-xl font-semibold tracking-tight">把图片拖到这里</div>
               <div className="mt-1 text-sm text-muted-foreground">
-                JPG / PNG / WebP / AVIF · 加入后队列将锁定，等待处理
+                支持拖入图片或文件夹 · JPG / PNG / WebP / AVIF · 加入后队列将锁定
               </div>
             </div>
           </div>
@@ -327,6 +425,10 @@ export default function Home() {
             <Button type="button" variant="secondary" onClick={() => fileInputRef.current?.click()}>
               选择文件
             </Button>
+            <Button type="button" variant="secondary" className="gap-2" onClick={() => folderInputRef.current?.click()}>
+              <FolderOpen className="h-4 w-4" />
+              选择文件夹
+            </Button>
             <input
               ref={fileInputRef}
               type="file"
@@ -334,7 +436,19 @@ export default function Home() {
               accept="image/*"
               className="hidden"
               onChange={(e) => {
-                if (e.target.files) addFiles(e.target.files);
+                if (e.target.files) void addFiles(e.target.files);
+                e.currentTarget.value = "";
+              }}
+            />
+            <input
+              ref={folderInputRef}
+              type="file"
+              multiple
+              accept="image/*"
+              className="hidden"
+              {...{ webkitdirectory: "", directory: "" }}
+              onChange={(e) => {
+                if (e.target.files) void addFiles(e.target.files);
                 e.currentTarget.value = "";
               }}
             />
@@ -383,7 +497,7 @@ export default function Home() {
 
         <div className="mt-6 grid grid-cols-1 lg:grid-cols-[380px_1fr] gap-6">
           {/* Left rail */}
-          <Card className="p-5 md:p-6 h-fit sticky top-6">
+          <Card className="order-2 h-fit p-5 md:p-6 lg:order-1 lg:sticky lg:top-6">
             <div className="flex items-center justify-between">
               <div className="text-sm font-semibold tracking-wide">参数</div>
               <div className="text-xs text-muted-foreground font-mono">MVP</div>
@@ -516,7 +630,7 @@ export default function Home() {
           </Card>
 
           {/* Workspace */}
-          <Card className="p-4 md:p-5">
+          <Card className="order-1 p-4 md:p-5 lg:order-2">
             <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="text-sm font-semibold">工作区</div>
               <div className="flex items-center gap-2">
